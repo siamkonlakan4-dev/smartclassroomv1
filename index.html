@@ -9,6 +9,9 @@
 <link href="https://fonts.googleapis.com/css2?family=Mitr:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
 <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-auth-compat.js"></script>
 <style>
   :root{
     --bg1:#eef2ff;--bg2:#fdf0ff;--bg3:#f2f5ff;--card:#fff;--label:#8a8a96;--sep:#ececf3;
@@ -265,9 +268,25 @@ body{font-size:16.5px;padding-bottom:110px}
    pw ว่าง = ยังไม่ตั้ง → ใช้วันเกิดเข้าครั้งแรก
    mustChange = true → ถูกบังคับตั้งรหัสใหม่หลังล็อกอิน
    ============================================================ */
-const DB_KEY='classroom_rbac_v3';
-let DB=load();
+/* ===== FIREBASE — โปรเจกต์เดียวกับ Smart Saving ===== */
+const firebaseConfig = {
+  apiKey: "AIzaSyBxoyVmWP-E4FEp3LJFZrFHFxpcgOETpRM",
+  authDomain: "siam4-25f3c.firebaseapp.com",
+  databaseURL: "https://siam4-25f3c-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "siam4-25f3c",
+  storageBucket: "siam4-25f3c.firebasestorage.app",
+  messagingSenderId: "650091978556",
+  appId: "1:650091978556:web:a03ee813aa9ceeef5d8839"
+};
+firebase.initializeApp(firebaseConfig);
+const fdb=firebase.database();
+const authReady=firebase.auth().signInAnonymously().then(()=>true)
+  .catch(e=>{console.warn('anon auth',e);banner('เชื่อม Firebase ไม่ได้ ต้องเปิด Anonymous Auth',true);return false;});
+
+const DB_PATH='classroom_v3';            // ← เก็บทั้งระบบไว้ที่ node นี้
+let DB=blankDB();                         // ค่าตั้งต้นก่อนโหลดจากคลาวด์
 let session=null;
+let dbLoaded=false,_applyingRemote=false,_saveTimer=null;
 
 function blankDB(){return{
   systemName:'ระบบเช็กชื่อห้องเรียน',logo:'',school:'โรงเรียนตัวอย่าง',
@@ -275,14 +294,81 @@ function blankDB(){return{
   users:[{id:'admin',username:'admin',name:'ผู้ดูแลระบบ',role:'admin',password:'plain$admin',active:true,createdAt:new Date().toISOString()}],
   classrooms:[],students:[],subjects:[],assignments:[],logs:[]
 };}
-function load(){try{const d=JSON.parse(localStorage.getItem(DB_KEY));if(!d)return blankDB();
-  if(!d.users||!d.users.length)d.users=blankDB().users;
-  if(!d.logs)d.logs=[];if(!d.weights)d.weights={during:70,final:30};
-  if(d.logo===undefined)d.logo='';if(!d.systemName)d.systemName='ระบบเช็กชื่อห้องเรียน';
-  (d.subjects||[]).forEach(s=>{if(!s.classroomIds)s.classroomIds=[];});
-  (d.students||[]).forEach(s=>{if(s.birthdate===undefined)s.birthdate='';if(s.pw===undefined)s.pw='';if(s.mustChange===undefined)s.mustChange=true;});
-  return d;}catch(e){return blankDB();}}
-function save(){localStorage.setItem(DB_KEY,JSON.stringify(DB));}
+
+/* RTDB ตัด array ว่างทิ้ง/แปลงเป็น object — ฟังก์ชันนี้ฟื้นโครงสร้างให้ครบ */
+function asArr(x){return Array.isArray(x)?x:(x&&typeof x==='object'?Object.values(x):[]);}
+function normalizeDB(d){
+  if(!d)return blankDB();
+  d.users=asArr(d.users);if(!d.users.length)d.users=blankDB().users;
+  d.classrooms=asArr(d.classrooms);d.students=asArr(d.students);
+  d.subjects=asArr(d.subjects);d.assignments=asArr(d.assignments);d.logs=asArr(d.logs);
+  if(!d.weights)d.weights={during:70,final:30};
+  if(d.logo===undefined)d.logo='';
+  if(!d.systemName)d.systemName='ระบบเช็กชื่อห้องเรียน';
+  d.subjects.forEach(s=>{s.classroomIds=asArr(s.classroomIds);});
+  d.assignments.forEach(a=>{if(!a.scores)a.scores={};});
+  d.students.forEach(s=>{
+    if(s.birthdate===undefined)s.birthdate='';
+    if(s.pw===undefined)s.pw='';
+    if(s.mustChange===undefined)s.mustChange=true;
+    if(!s.attendance)s.attendance={};
+  });
+  return d;
+}
+
+/* ===== SAVE → เขียนขึ้น Firebase (หน่วงเล็กน้อยกันยิงถี่) ไม่แตะ localStorage ===== */
+function save(){
+  if(_applyingRemote)return;                 // อย่าดันข้อมูลที่เพิ่งรับมากลับขึ้นไป
+  clearTimeout(_saveTimer);
+  _saveTimer=setTimeout(()=>{
+    fdb.ref(DB_PATH).set(JSON.parse(JSON.stringify(DB)))   // ล้าง undefined ก่อนส่ง
+      .catch(e=>{console.warn('save failed',e);banner('บันทึกขึ้นคลาวด์ไม่สำเร็จ',true);});
+  },400);
+}
+
+/* ===== รับเรียลไทม์จากทุกอุปกรณ์ ===== */
+function applyRemote(v){_applyingRemote=true;DB=normalizeDB(v?JSON.parse(JSON.stringify(v)):null);_applyingRemote=false;}
+function onRemoteUpdate(){
+  if(!session){renderLoginBrand();return;}
+  if(session.role!=='student'){
+    const u=userById(session.id);
+    if(!u||!u.active){banner('บัญชีถูกปรับปรุงจากอุปกรณ์อื่น',true);return logout();}
+    session=u;                               // ผูก session กับ object ใน DB ก้อนใหม่
+  }else{
+    const stu=DB.students.find(s=>s.id===session.studentId);
+    if(!stu){banner('ข้อมูลนักเรียนถูกลบ',true);return logout();}
+  }
+  if(document.getElementById('modalBg').classList.contains('open'))return; // กำลังแก้ไขอยู่ อย่าเด้งจอ
+  renderLoginBrand();
+  if(isStudent())renderPortal();else render();
+}
+function startSync(){
+  fdb.ref(DB_PATH).on('value',snap=>{
+    const v=snap.val();
+    if(!v){                                  // คลาวด์ว่าง → วางข้อมูลตั้งต้นขึ้นไป
+      _applyingRemote=true;DB=blankDB();_applyingRemote=false;
+      fdb.ref(DB_PATH).set(JSON.parse(JSON.stringify(DB)));
+      if(!dbLoaded){dbLoaded=true;firstBoot();}return;
+    }
+    applyRemote(v);
+    if(!dbLoaded){dbLoaded=true;firstBoot();}
+    else onRemoteUpdate();
+  },e=>{console.warn('read failed',e);banner('อ่านข้อมูลจาก Firebase ไม่ได้ ตรวจสอบ Rules',true);});
+}
+function firstBoot(){
+  renderLoginBrand();
+  let saved=null;try{saved=sessionStorage.getItem('cr_uid');}catch(e){}
+  if(saved){
+    if(saved.startsWith('stu_')){
+      const sid=saved.slice(4);const stu=DB.students.find(s=>s.id===sid);
+      if(stu){session=studentSession(stu);enterApp();return;}
+    }else{
+      const u=userById(saved);
+      if(u&&u.active){session=u;enterApp();return;}
+    }
+    try{sessionStorage.removeItem('cr_uid');}catch(e){}
+  }
+}
 const uid=()=>Math.random().toString(36).slice(2,9);
 const today=()=>new Date().toISOString().slice(0,10);
 const THDAYS=['อาทิตย์','จันทร์','อังคาร','พุธ','พฤหัสบดี','ศุกร์','เสาร์'];
@@ -373,6 +459,7 @@ document.getElementById('popupBg').addEventListener('click',()=>document.getElem
 function studentSession(stu){return{id:'stu_'+stu.id,role:'student',name:stu.name,studentId:stu.id,username:stu.code};}
 function persistSession(id){try{sessionStorage.setItem('cr_uid',id);}catch(e){}}
 async function doLogin(){
+  if(!dbLoaded)return banner('กำลังโหลดข้อมูลจากคลาวด์ สักครู่…',true);  
   const u=val('loginUser'),p=val('loginPass');
   if(!u||!p)return banner('กรอกชื่อผู้ใช้และรหัสผ่าน',true);
   // 1) บัญชีเจ้าหน้าที่ (ครู/แอดมิน)
@@ -1108,19 +1195,7 @@ function exportJSON(){if(!isAdmin())return;dl(`backup_${today()}.json`,JSON.stri
    ============================================================ */
 (function boot(){
   renderLoginBrand();
-  let saved=null;try{saved=sessionStorage.getItem('cr_uid');}catch(e){}
-  if(saved){
-    if(saved.startsWith('stu_')){
-      const sid=saved.slice(4);const stu=DB.students.find(s=>s.id===sid);
-      if(stu){session=studentSession(stu);
-        if(stu.mustChange){enterApp();return;}
-        enterApp();return;}
-    }else{
-      const u=userById(saved);
-      if(u&&u.active){session=u;enterApp();return;}
-    }
-    try{sessionStorage.removeItem('cr_uid');}catch(e){}
-  }
+  authReady.then(()=>startSync());   // ล็อกอิน Firebase ก่อน แล้วค่อยซิงก์
 })();
 </script>
 </body>
