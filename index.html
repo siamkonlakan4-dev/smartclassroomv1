@@ -563,7 +563,7 @@ function popup(kind,name,msg,photo){
   $('popNm').textContent=name||''; $('popMs').textContent=msg||'';
   const ph=$('popPh'); if(photo){ph.src=photo;ph.style.display='block';}else ph.style.display='none';
   m.classList.add('show'); beep(kind);
-  clearTimeout(popTimer); popTimer=setTimeout(()=>m.classList.remove('show'),3000);
+  clearTimeout(popTimer); popTimer=setTimeout(()=>m.classList.remove('show'),2500);
 }
 let AC=null;
 function beep(kind){try{AC=AC||new(window.AudioContext||window.webkitAudioContext)();const o=AC.createOscillator(),g=AC.createGain();o.connect(g);g.connect(AC.destination);const f=kind==='success'?[880,1320]:kind==='duplicate'?[660,520]:[320,260];o.type='sine';o.frequency.value=f[0];g.gain.setValueAtTime(.001,AC.currentTime);g.gain.exponentialRampToValueAtTime(.25,AC.currentTime+.02);o.start();o.frequency.setValueAtTime(f[1],AC.currentTime+.08);g.gain.exponentialRampToValueAtTime(.001,AC.currentTime+.22);o.stop(AC.currentTime+.24);}catch(e){}}
